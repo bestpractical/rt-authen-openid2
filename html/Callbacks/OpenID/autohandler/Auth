@@ -1,5 +1,11 @@
 <%INIT>
 return unless ($RT::EnableOpenId);
+
+# { idp.domain.com => { TrustEmail => 1,Privileged => 1,
+#                       Groups => ['Employee' ] } }
+
+my $create_trust = RT::Config->Get('OpenIDCreateTrust');
+
 use Net::OpenID::Consumer;
 use LWPx::ParanoidAgent;
 use Cache::FileCache;
@@ -8,26 +14,24 @@ my $openid_url = ref( $ARGS{openid} ) ? $ARGS{openid}->[0] : $ARGS{openid};
 my $user;
 my $check_url;
 
-# Livejournal misencodes responses...
-if ($ARGS{'openid.sig'}) {
-my $sig = $m->cgi_object->param('openid.sig') ||'';
-$sig =~ s/ /+/g;
-$m->cgi_object->param( 'openid.sig' => $sig );
-}
-
-
 my $root_user = RT::User->new($RT::SystemUser);
 my $csr = Net::OpenID::Consumer->new(
-    ua              => LWPx::ParanoidAgent->new,
+    ua              => LWP::UserAgent->new, #LWPx::ParanoidAgent->new,
     args            => \%ARGS,
     cache           => Cache::FileCache->new,
-    consumer_secret => $RT::DatabasePassword,
+    consumer_secret => 'fnordhatew',
     required_root => $RT::WebURL,
 );
 
-
 if ($openid_url) {
     if ( my $claimed_identity = $csr->claimed_identity("$openid_url")) {
+        $claimed_identity->set_extension_args(
+            'http://openid.net/extensions/sreg/1.1',
+            {
+                required => 'email',
+                optional => 'fullname,nickname',
+            },
+        );
         $check_url = $claimed_identity->check_url(
                 return_to      => $RT::WebURL,
                 delayed_return => 1,
@@ -39,18 +43,29 @@ if ($openid_url) {
         # we should end up skipping the rest now
     }
 }
+
+my $sreg;
+my $email;
+
 if ( $ARGS{"openid.mode"} ) {
     if ( my $setup_url = $csr->user_setup_url ) {
-
         # redirect/link/popup user to $setup_url
         RT::Interface::Web::Redirect($setup_url);
     } elsif ( $csr->user_cancel ) {
     } elsif ( my $vident = $csr->verified_identity ) {
         $user = $vident->url;
+
+        $sreg = $vident->signed_extension_fields(
+            'http://openid.net/extensions/sreg/1.1',
+        );
+        $email = $sreg->{email};
+
     } else {
         die ( "Error validating identity: " . $csr->err );
     }
 }
+
+#die( loc( "Cannot create user: [_1]", $msg ) );
 
 # if the user isn't logged in and we got credentials from OpenID, load them
 if ( ( !$session{'CurrentUser'} ) && ($user) ) {
@@ -63,26 +78,41 @@ if ( ( !$session{'CurrentUser'} ) && ($user) ) {
 
     # we've got a valid user, so try to load
     $session{'CurrentUser'} = RT::CurrentUser->new();
-    $session{'CurrentUser'}->LoadByCols( Name => $user );
-    $session{'CurrentUser'}->{'OpenID'} = 1;    
-    if ( $session{'CurrentUser'}->id ) {
+
+    my $attribute = RT::Attributes->new($RT::SystemUser);
+    $attribute->Limit( FIELD => 'ObjectType', VALUE => 'RT::User' );
+    $attribute->Limit( FIELD => 'Content', VALUE => $user );
+    if ( my $a = $attribute->First ) {
+        $session{'CurrentUser'}->Load( $a->Object->Id );
+        $session{'CurrentUser'}->{'OpenID'} = 1;
         $RT::Logger->info($session{'CurrentUser'}->Name ." logged in with openid"); 
     } else {
         my $UserObj = RT::User->new($RT::SystemUser);
-        my ( $id, $msg ) = $UserObj->Create(
-            Name => $user,
 
+        use List::Util 'first';
+
+        my $trust_entry = first { $user =~ m{^https?://\Q$_} }
+            sort { length $b <=> length $a } keys %$create_trust;
+
+        $trust_entry = $create_trust->{$trust_entry};
+        my ( $id, $msg ) = $UserObj->Create(
+            Name => $sreg->{nick} || $email || $user,
+            RealName => $sreg->{fullname} || '',
             #RealName => $user->{'name'},
             #EmailAddress => $user->{'email'},
-            Privileged => 0,
+            Privileged => $trust_entry->{Privileged} || 0,
+            $trust_entry->{TrustEmail} ? ( EmailAddress => $email) : (),
+
         );
         $RT::Logger->info($user ." attempted an account creation with OpenID: $msg");
+        
         if ( $UserObj->id ) {
 
             # created the user, now load them as the current user
             $session{'CurrentUser'}->Load( $UserObj->id );
             $session{'i'}++;
             # redirect the user to their preference page to add more info
+            $UserObj->AddAttribute(Name => 'OpenID', Description => 'OpenID Identifier', Content => $user);
             RT::Interface::Web::Redirect( $RT::WebURL . '/User/Prefs.html' );
         } else {
 

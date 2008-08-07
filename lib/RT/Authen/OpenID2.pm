@@ -8,8 +8,8 @@ It is freely redistributable under the terms of version 2 of the GNU GPL.
 
 =cut
 
-package RT::Authen::OpenID;
+package RT::Authen::OpenID2;
 
-our $VERSION = '0.02';
+our $VERSION = '0.01';
 
 1;
